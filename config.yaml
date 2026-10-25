@@ -1,0 +1,64 @@
+# see-china 配置：《带你看中国 See China》英文系列（YouTube/Instagram 手动上传）
+topics:
+  - "The Great Wall: 2,000 Years of Wonder"
+  - "High-Speed Rail: Crossing China at 350 km/h"
+  - "Hotpot: China's Favorite Way to Dinner"
+  - "Shanghai: The Skyline That Grew Overnight"
+  - "Giant Pandas: China's National Treasure"
+  - "Chinese Street Food Breakfast Tour"
+  - "The Forbidden City: 9,999 Rooms of Mystery"
+  - "Mobile Payment: A Cashless Day in China"
+  - "Zhangjiajie: The Real Avatar Mountains"
+  - "Spring Festival: The World's Largest Migration"
+  - "Beijing Hutongs: Old Alleys, New Life"
+  - "Guilin: Painted Landscapes Come True"
+  - "The Terracotta Army: An Underground Empire"
+  - "Night Markets: China After Dark"
+  - "Tea Culture: A Cup of 1,000 Years"
+  - "Suzhou: Venice of the East"
+  - "Chinese High-Tech Life: Delivery in 30 Minutes"
+  - "The Silk Road: Where East Met West"
+  - "Harbin Ice Festival: A City of Crystal"
+  - "West Lake: Poetry in a Landscape"
+  - "Cantonese Dim Sum: The Art of Small Dishes"
+  - "Tibet Railway: The Roof of the World"
+  - "Chinese Calligraphy: Dancing Ink"
+  - "Lantern Festival: Lighting Up the Sky"
+  - "Chengdu: The Slowest Fast City"
+  - "The Grand Canal: World's Longest River Road"
+  - "Chinese Gardens: Landscapes of the Mind"
+  - "Qingming: When China Remembers"
+  - "Dragon Boat Festival: Racing the River"
+  - "Mid-Autumn: The Festival of the Moon"
+
+video:
+  width: 1920
+  height: 1080
+  fps: 30
+  sections_min: 10         # 段数（英文 55-95 词/段 → 每段 20-35 秒）
+  sections_max: 14
+  chars_per_section: [55, 95]   # 英文按词数计
+
+transition:
+  fade_seconds: 0.6
+  styles:                  # 转场轮换（旅行内容轻快些）
+    - fade
+    - dissolve
+    - wipeleft
+    - circleopen
+    - fadeblack
+
+narrator:
+  backend: "edge"             # edge 恢复后自动用 Guy/Aria 神经音色
+  voice: "en-US-GuyNeural"    # 美式男声（旅行host感）
+  rate: "+3%"
+  allow_sapi_fallback: true   # edge 被封期间允许 Zira 兜底（试播集用，人工上传前自行把关）
+
+copywriter:
+  model: "glm-4-flash"
+  temperature: 0.8
+
+bgm_volume: 0.20
+bgm_dir: "../bili-history/bgm"   # 复用军史号 CC 曲库
+
+hashtags: ["SeeChina", "ChinaTravel", "ChinaExplained"]

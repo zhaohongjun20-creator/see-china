@@ -1,0 +1,16 @@
+.env
+__pycache__/
+*.pyc
+downloads/
+data/
+logs/
+imgs/
+audio/
+*.list.txt
+.pytest_cache/
+lyricvideo/
+logs/
+output/
+audio/
+imgs/
+downloads/
