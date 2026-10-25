@@ -127,7 +127,7 @@ def run(topic_index: int | None = None, redo: bool = False,
 
     # ① 启动前检查：在消耗任何 API 额度之前把配置/路径/素材/服务问题拦下
     pc = precheck.run_precheck(cfg, BASE, pex, zhipu,
-                               check_services=check_services)
+                               probe_services=check_services)
     log.info("Precheck:\n%s", pc.summary())
     if pc.warnings:
         log.warning("precheck warnings: %d", len(pc.warnings))
@@ -676,11 +676,12 @@ def tts_report(cfg: dict) -> list:
 
 def cmd_doctor(check_services: bool = True) -> int:
     """一键体检：precheck + TTS 链路真实探针。填完 .env 后先跑这个再生产。"""
+    load_dotenv(BASE / ".env")                 # 与 run() 一致：先加载 .env 再体检
     cfg = load_config()
     pc = precheck.run_precheck(cfg, BASE,
                                os.environ.get("PEXELS_API_KEY", ""),
                                os.environ.get("ZHIPU_API_KEY", ""),
-                               check_services=check_services)
+                               probe_services=check_services)
     print("== 启动检查 ==")
     print(pc.summary())
     print("== TTS 后端探测（不消耗任何付费额度）==")

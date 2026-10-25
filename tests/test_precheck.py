@@ -61,7 +61,7 @@ def test_full_precheck_ok(tmp_path, monkeypatch):
     (tmp_path / "bgm" / "a.mp3").write_bytes(b"x")
     monkeypatch.setenv("ZHIPU_API_KEY", "k1")
     monkeypatch.setenv("PEXELS_API_KEY", "k2")
-    pc = P.run_precheck(cfg, tmp_path, check_services=False)
+    pc = P.run_precheck(cfg, tmp_path, probe_services=False)
     assert pc.ok, pc.summary()
 
 
@@ -70,7 +70,7 @@ def test_empty_bgm_dir_blocks_startup(tmp_path, monkeypatch):
     (tmp_path / "bgm").mkdir()
     monkeypatch.setenv("ZHIPU_API_KEY", "k1")
     monkeypatch.setenv("PEXELS_API_KEY", "k2")
-    pc = P.run_precheck(cfg, tmp_path, check_services=False)
+    pc = P.run_precheck(cfg, tmp_path, probe_services=False)
     assert not pc.ok
     assert any("bgm" in r.name for r in pc.errors)
 
@@ -79,7 +79,7 @@ def test_missing_bgm_dir_blocks_startup(tmp_path, monkeypatch):
     cfg = base_cfg(tmp_path)                 # bgm 目录不存在
     monkeypatch.setenv("ZHIPU_API_KEY", "k1")
     monkeypatch.setenv("PEXELS_API_KEY", "k2")
-    pc = P.run_precheck(cfg, tmp_path, check_services=False)
+    pc = P.run_precheck(cfg, tmp_path, probe_services=False)
     assert not pc.ok
     assert any("bgm" in r.name for r in pc.errors)
 
@@ -90,6 +90,6 @@ def test_missing_key_blocks_startup(tmp_path, monkeypatch):
     (tmp_path / "bgm" / "a.mp3").write_bytes(b"x")
     monkeypatch.delenv("ZHIPU_API_KEY", raising=False)
     monkeypatch.delenv("PEXELS_API_KEY", raising=False)
-    pc = P.run_precheck(cfg, tmp_path, check_services=False)
+    pc = P.run_precheck(cfg, tmp_path, probe_services=False)
     assert not pc.ok
     assert any(r.name.startswith("env:") for r in pc.errors)

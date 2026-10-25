@@ -252,7 +252,7 @@ def check_services(pexels_key: str, zhipu_key: str) -> list:
 
 
 def run_precheck(cfg: dict, project_dir, pexels_key: str = "", zhipu_key: str = "",
-                 check_services: bool = True) -> Precheck:
+                 probe_services: bool = True) -> Precheck:
     """完整启动前检查。pex/zhipu key 只用于服务连通性检查，不会被打印。"""
     pc = Precheck()
     for r in check_env():
@@ -262,7 +262,7 @@ def run_precheck(cfg: dict, project_dir, pexels_key: str = "", zhipu_key: str = 
     for r in check_paths(cfg, Path(project_dir)):
         pc.results.append(r)
     # Key 缺失时不再发外网请求（env 检查已经报错，连通性无意义）
-    if check_services and pexels_key and zhipu_key:
+    if probe_services and pexels_key and zhipu_key:
         for r in check_services(pexels_key, zhipu_key):
             pc.results.append(r)
     return pc
