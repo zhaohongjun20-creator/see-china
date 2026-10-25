@@ -85,6 +85,30 @@ def section_need(dur: float, index: int, total: int, cfg: dict) -> float:
     return dur + fade + (tail if index < total - 1 else end_hold)
 
 
+def build_upload_info(doc: dict, records: list, cfg: dict) -> str:
+    """统一上传说明生成（评审#4）：正常打包与人工批准共用同一套逻辑，
+    保证两条路径的 upload_info.txt 字段完全一致（署名/片段区间/IG 文案/标签）。"""
+    credits = []
+    for r in records:
+        author = f" by {r['author']}" if r.get("author") else ""
+        seg = (f", used {r.get('segment_start', 0):.1f}s-"
+               f"{r.get('segment_start', 0) + r.get('segment_seconds', 0):.1f}s"
+               if r.get("segment_seconds") else "")
+        credits.append(f"Pexels #{r['asset_id']}{author}: '{r['query_used']}'{seg} "
+                       f"({r['source_url']}) — {r['license']}")
+    tags = list(dict.fromkeys(doc.get("tags", [])[:8] + cfg.get("hashtags", [])))
+    return (
+        f"TITLE: {doc['title']}\n\n"
+        f"DESCRIPTION:\n{doc.get('description', '')}\n\n"
+        f"A journey through real China — history, food, technology and daily "
+        f"life. New episodes weekly. Subscribe and see China with your own eyes.\n\n"
+        f"Footage credits:\n" + "\n".join(dict.fromkeys(credits)) +
+        f"\n\nTAGS: {', '.join(tags)}\n"
+        f"IG_CAPTION: {doc['title']} 🇨🇳 #seechina #china #travelchina "
+        f"#chineseculture #discoverchina #travel\n"
+    )
+
+
 def _extract_cover(final, cover):
     import imageio_ffmpeg
     subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-ss", "2",
@@ -379,6 +403,12 @@ def _produce(topic: str, cfg: dict, store: Store, zhipu: str, pex: str) -> int:
         job.materials_index.write_text(
             json.dumps(final_records, ensure_ascii=False, indent=1),
             encoding="utf-8")
+        # 兜底素材 → 任务级质量标记（评审#3：不允许只记日志就放行）
+        fallback_secs = [i for i, r in enumerate(final_records) if r.get("fallback")]
+        if fallback_secs:
+            mf.set("fallback_footage_used", fallback_secs)
+            log.warning("generic fallback footage used for sections %s — "
+                        "episode will require human review", fallback_secs)
 
     stage("clips", clips_done, do_clips)
 
@@ -434,9 +464,9 @@ def _produce(topic: str, cfg: dict, store: Store, zhipu: str, pex: str) -> int:
         return mf.stage_status("qc") == "done"
 
     def do_qc():
-        expected = (sum(mf.section(i)["narration"]["duration"]
-                        for i in range(nsec))
-                    + (fade + tail) * (nsec - 1) + end_hold)
+        expected = slideshow.expected_total_duration(
+            [mf.section(i)["narration"]["duration"] for i in range(nsec)],
+            fade, tail, end_hold)
         ok, results = qc.run_qc(
             job.final, job.srt, job.cover, expected_duration=expected,
             spec=(vc["width"], vc["height"], vc["fps"]),
@@ -464,7 +494,9 @@ def _produce(topic: str, cfg: dict, store: Store, zhipu: str, pex: str) -> int:
                                        model=rev_cfg.get("model",
                                                          cfg["copywriter"]["model"]))
         decision = review_mod.decide_with_flags(
-            result, sapi_used=bool(mf.data.get("sapi_fallback_used")))
+            result,
+            sapi_used=bool(mf.data.get("sapi_fallback_used")),
+            fallback_used=bool(mf.data.get("fallback_footage_used")))
         mf.set("review", {"status": result["status"], "decision": decision,
                           "issues": result["issues"],
                           "deterministic_issues": result["deterministic_issues"]})
@@ -499,26 +531,7 @@ def _produce(topic: str, cfg: dict, store: Store, zhipu: str, pex: str) -> int:
         if not job.cover.is_file():
             _extract_cover(job.final, job.cover)
         records = [mf.section(i)["material"] for i in range(nsec)]
-        credits = []
-        for r in records:
-            author = f" by {r['author']}" if r.get("author") else ""
-            seg = (f", used {r.get('segment_start', 0):.1f}s-"
-                   f"{r.get('segment_start', 0) + r.get('segment_seconds', 0):.1f}s"
-                   if r.get("segment_seconds") else "")
-            credits.append(f"Pexels #{r['asset_id']}{author}: "
-                           f"'{r['query_used']}'{seg} ({r['source_url']}) — "
-                           f"{r['license']}")
-        tags = doc.get("tags", [])[:8] + cfg.get("hashtags", [])
-        info = (
-            f"TITLE: {doc['title']}\n\n"
-            f"DESCRIPTION:\n{doc.get('description', '')}\n\n"
-            f"A journey through real China — history, food, technology and daily "
-            f"life. New episodes weekly. Subscribe and see China with your own eyes.\n\n"
-            f"Footage credits:\n" + "\n".join(dict.fromkeys(credits)) +
-            f"\n\nTAGS: {', '.join(dict.fromkeys(tags))}\n"
-            f"IG_CAPTION: {doc['title']} 🇨🇳 #seechina #china #travelchina "
-            f"#chineseculture #discoverchina #travel\n"
-        )
+        info = build_upload_info(doc, records, cfg)
         job.upload_info.write_text(info, encoding="utf-8")
         mf.set("outputs", {"final": str(job.final), "cover": str(job.cover),
                            "srt": str(job.srt),
@@ -583,15 +596,7 @@ def cmd_review_job(job_id: str, approve: bool) -> int:
     mf.stage("review").update({"status": "done", "decision": "approved"})
     mf.save()
     records = [mf.section(i)["material"] for i in range(len(doc["sections"]))]
-    credits = []
-    for r in records:
-        author = f" by {r['author']}" if r.get("author") else ""
-        credits.append(f"Pexels #{r['asset_id']}{author}: '{r['query_used']}' "
-                       f"({r['source_url']}) — {r['license']}")
-    tags = doc.get("tags", [])[:8] + cfg.get("hashtags", [])
-    info = (f"TITLE: {doc['title']}\n\nDESCRIPTION:\n{doc.get('description','')}\n\n"
-            f"Footage credits:\n" + "\n".join(dict.fromkeys(credits)) +
-            f"\n\nTAGS: {', '.join(dict.fromkeys(tags))}\n")
+    info = build_upload_info(doc, records, cfg)
     job.upload_info.write_text(info, encoding="utf-8")
     mf.set("outputs", {"final": str(job.final), "cover": str(job.cover),
                        "srt": str(job.srt), "upload_info": str(job.upload_info),

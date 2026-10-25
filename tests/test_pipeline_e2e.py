@@ -177,3 +177,10 @@ def test_human_review_flow(env, monkeypatch):
     assert rc == 0
     assert j.upload_info.exists()
     assert store.topic_row("Test Topic")["status"] == "ready"
+
+    # 人工批准路径的上传包与正常打包同构（评审#4）：作者/片段区间/IG 文案齐全
+    info = j.upload_info.read_text(encoding="utf-8")
+    assert "TITLE: Test Episode" in info
+    assert "IG_CAPTION:" in info and "TAGS:" in info
+    assert "Pexels #100 by Test Author" in info
+    assert "used 0.0s-" in info            # 片段区间来自 clips 阶段的溯源数据

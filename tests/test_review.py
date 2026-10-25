@@ -88,15 +88,20 @@ def test_decide_matrix():
     assert R.decide({"status": "unavailable", "issues": []}) == "retry"
 
 
-def test_decide_with_sapi_flag_forces_human():
-    # 使用了 SAPI 机械音兜底 → 即使 AI 审核通过也强制人工裁决（评审#6）
+def test_decide_with_flags_matrix():
+    # SAPI 机械音 / 通用兜底素材，任一任务级标记都强制人工裁决（评审#3/#6）
     assert R.decide_with_flags({"status": "pass", "issues": []},
                                sapi_used=True) == "human"
     assert R.decide_with_flags({"status": "pass", "issues": []},
-                               sapi_used=False) == "ready"
-    # 审核通道不可用优先 retry（等恢复后连同机械音标记一起重新裁决）
+                               fallback_used=True) == "human"
+    assert R.decide_with_flags({"status": "pass", "issues": []},
+                               sapi_used=True,
+                               fallback_used=True) == "human"
+    assert R.decide_with_flags({"status": "pass", "issues": []}) == "ready"
+    # 审核通道不可用优先 retry（等恢复后连同标记一起重新裁决）
     assert R.decide_with_flags({"status": "unavailable", "issues": []},
-                               sapi_used=True) == "retry"
+                               sapi_used=True,
+                               fallback_used=True) == "retry"
 
 
 def test_run_review_combines_layers(monkeypatch):

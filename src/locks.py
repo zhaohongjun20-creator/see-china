@@ -77,12 +77,14 @@ class InstanceLock:
             return {"pid": 0, "host": "unknown", "started": "unknown", "ts": 0}
 
     def _stale(self, holder: dict) -> bool:
-        if holder.get("pid") and not pid_alive(int(holder.get("pid") or 0)):
-            return True                      # 崩溃残留：进程已死
+        pid = int(holder.get("pid") or 0)
+        if pid:
+            # 有 pid 记录时只认进程存活 —— 活进程绝不因锁龄被接管，
+            # 否则长任务（>max_age）会被第二个实例破坏互斥（评审#2）。
+            return not pid_alive(pid)
+        # 无有效 pid（老格式/损坏锁文件）才退化为按锁龄判断
         ts = float(holder.get("ts") or 0)
-        if ts and time.time() - ts > self.max_age_seconds:
-            return True                      # 过期残留
-        return False
+        return bool(ts and time.time() - ts > self.max_age_seconds)
 
     # ── 对外 ─────────────────────────────────────────────
     def acquire(self) -> "InstanceLock":

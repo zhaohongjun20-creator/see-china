@@ -193,20 +193,30 @@ def decide(result: dict) -> str:
     return "ready"
 
 
-def decide_with_flags(result: dict, sapi_used: bool = False) -> str:
-    """在 decide() 基础上叠加任务级人工审核标记。
+def decide_with_flags(result: dict, sapi_used: bool = False,
+                      fallback_used: bool = False) -> str:
+    """在 decide() 基础上叠加任务级人工审核标记（评审#3/#6）。
 
-    sapi_used=True（使用了本地 SAPI 机械音兜底）→ 强制进入人工裁决：
-    机械音质量不符合海外频道目标，不允许静默出片（评审要求 #6）。
-    审核通道不可用时优先 retry —— 等审核恢复后连同机械音标记一起重新裁决。
+    - sapi_used：使用了本地 SAPI 机械音兜底 → 强制人工裁决；
+    - fallback_used：有段落用了通用兜底素材（china city scenery）→ 强制人工裁决，
+      不允许"旁白讲熊猫、画面放城市风景"的成片仅凭 AI pass 就进发布包。
+    审核通道不可用时优先 retry —— 等恢复后连同标记一起重新裁决。
     """
-    if sapi_used and result.get("status") != "unavailable":
+    flags = []
+    if sapi_used:
+        flags.append(("narration produced with local SAPI fallback "
+                      "(mechanical voice, quality gate)",
+                      "re-synthesize with a neural voice, or approve manually"))
+    if fallback_used:
+        flags.append(("generic fallback footage (china city scenery) used for "
+                      "some sections — visuals may not match narration",
+                      "replace with topic-specific footage or approve manually"))
+    if flags and result.get("status") != "unavailable":
         result = dict(result)
         result["status"] = "flagged"
-        result["issues"] = list(result.get("issues", [])) + [{
-            "section": -1, "severity": "high",
-            "issue": "narration produced with local SAPI fallback "
-                     "(mechanical voice, quality gate)",
-            "suggestion": "re-synthesize with a neural voice, or approve manually",
-            "needs_source": False}]
+        issues = list(result.get("issues", []))
+        for issue, suggestion in flags:
+            issues.append({"section": -1, "severity": "high", "issue": issue,
+                           "suggestion": suggestion, "needs_source": False})
+        result["issues"] = issues
     return decide(result)

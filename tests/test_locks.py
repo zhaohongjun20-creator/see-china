@@ -60,7 +60,21 @@ def test_alive_holder_rejected_then_takeover_after_death(tmp_path):
 
 def test_expired_lock_taken_over(tmp_path):
     path = tmp_path / "l.lock"
-    _write_holder(path, 0, ts=time.time() - 7 * 3600)   # 过期残留
+    _write_holder(path, 0, ts=time.time() - 7 * 3600)   # 过期残留（无 pid 可查）
     lk = InstanceLock(path, max_age_seconds=6 * 3600)
     lk.acquire()
     lk.release()
+
+
+def test_live_holder_never_taken_over_by_age(tmp_path):
+    """评审#2：活进程不能仅因锁龄超过 max_age 被接管（长任务保护）。"""
+    path = tmp_path / "l.lock"
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        time.sleep(0.5)
+        _write_holder(path, p.pid, ts=time.time() - 3600)   # 锁龄 1 小时 >> 1s
+        with pytest.raises(LockHeldError):                  # 仍被拒绝
+            InstanceLock(path, max_age_seconds=1).acquire()
+    finally:
+        p.terminate()
+        p.wait()

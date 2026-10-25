@@ -124,6 +124,24 @@ def _filter_path(p) -> str:
     return f"'{s}'"
 
 
+def expected_total_duration(voice_durations: list, fade: float, tail: float,
+                            end_hold: float) -> float:
+    """理论成片总长 —— QC 与合成的统一时间定义（评审#1 修复）。
+
+    推导（与 section_need / _xfade_video 完全一致）：
+      段 i 画面长 L_i = D_i + fade + tail_i（tail_{n-1} = end_hold）；
+      xfade 每个接缝吞掉一个 fade → 总长 = ΣL_i - fade*(n-1)
+                                      = ΣD + fade + tail*(n-1) + end_hold。
+      注意 fade 只出现一次：首段画面头部的 fade 恰好被接缝抵消，
+      段间旁白间隔为首段 tail+fade、其余 tail。QC 若按 (fade+tail)*(n-1)
+      累加会多算 (n-2)*fade，7 段以上即可误杀正常成片。
+    """
+    n = len(voice_durations)
+    if n == 0:
+        return 0.0
+    return float(sum(voice_durations)) + fade + tail * (n - 1) + end_hold
+
+
 def compose_final(section_files: list, voice_files: list, narrations: list,
                   out_path: str, bgm_path: str, srt_path: str,
                   bgm_volume: float = 0.22, fade: float = 0.6,
