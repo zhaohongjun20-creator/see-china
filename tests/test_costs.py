@@ -36,6 +36,8 @@ def test_ledger_lines_roundtrip(tmp_path):
 
 
 def test_timer_measures():
+    # sleep 50ms：Windows 的 monotonic 分辨率约 15.6ms（Python<3.13），
+    # sleep(0.01) 会测出 0.0 造成偶发失败
     with Timer() as t:
-        time.sleep(0.01)
+        time.sleep(0.05)
     assert t.seconds > 0
