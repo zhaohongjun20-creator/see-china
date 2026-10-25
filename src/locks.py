@@ -1,25 +1,37 @@
 # -*- coding: utf-8 -*-
-"""单实例原子锁（P1-2）。
+"""单实例锁（第四轮整改：OS 级文件锁，从根本上消除接管竞态）。
 
-修复旧实现"检查文件存在 → 再写入"的两步竞态：这里创建与独占检查合并为
-一次原子系统调用（os.open 的 O_CREAT|O_EXCL，Windows/POSIX 均原子），
-两个进程同时启动时只有一个能成功创建锁文件。
+评审#4 指出旧实现"改名隔离 + 重建"的接管流程存在竞态：两个进程可能同时
+判定同一把锁失效，后到者会把先到者刚创建的新锁再次改名，导致双持锁。
 
-锁文件内容为 JSON（pid/host/started），便于诊断与残留恢复：
-- 持有进程已死亡（崩溃残留）→ 自动接管
-- 锁龄超过 max_age_seconds → 视为过期残留，自动接管并告警
-- 释放永远走 release()/finally，不依赖正常执行到最后。
+本版不再有任何"接管"动作 —— 改用操作系统自带的文件区域锁：
+- Windows 用 msvcrt.locking，POSIX 用 fcntl.flock，都是内核原子操作；
+- 持有进程崩溃/被杀时内核自动释放 —— 不存在"残留锁"，无需接管、无需心跳；
+- 活进程持锁期间，其他进程的非阻塞加锁必然失败（活进程保护）；
+- 同一时刻最多一个进程持锁由内核保证，与重试/超时/锁龄参数无关。
+
+锁文件只作为汇合点与诊断信息载体（pid/host/started），不承载互斥语义；
+旧版本遗留的锁文件可被直接打开并加锁，无需迁移。
 """
 import json
 import os
 import socket
-import subprocess
 import time
 from pathlib import Path
 
+try:    # Windows
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None
+
+try:    # POSIX
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+
 
 class LockHeldError(RuntimeError):
-    """锁被另一个存活进程持有时抛出；holder 里是持有人信息（无任何密钥）。"""
+    """锁被另一个存活进程持有时抛出；holder 为持有人诊断信息（无密钥）。"""
 
     def __init__(self, holder: dict):
         self.holder = holder
@@ -28,89 +40,90 @@ class LockHeldError(RuntimeError):
                 **{**{"pid": "?", "host": "?", "started": "?"}, **holder}))
 
 
-def pid_alive(pid: int) -> bool:
-    """跨平台判断进程是否存活。pid 无效或已退出返回 False。"""
-    if not pid or pid <= 0:
-        return False
-    try:
-        if os.name == "nt":
-            # 中文 Windows 的 tasklist 输出是 GBK：显式容错解码
-            out = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                capture_output=True, text=True, encoding="utf-8",
-                errors="ignore", timeout=10).stdout
-            return str(pid) in out.replace(",", "")
-        os.kill(pid, 0)  # POSIX：进程不存在抛 ProcessLookupError
-        return True
-    except ProcessLookupError:
-        return False
-    except Exception:
-        return True  # 无法判断时保守认为存活，避免误抢活锁
-
-
 class InstanceLock:
-    """用法： with InstanceLock(path): ...（异常退出也会释放）"""
+    """用法： with InstanceLock(path): ...
 
-    def __init__(self, path, max_age_seconds: int = 6 * 3600):
+    非阻塞尝试获取 OS 文件锁；被占用时立即抛 LockHeldError（不等待、不接管）。
+    """
+
+    #: 锁区域放在离内容 1MiB 处：Windows 的区域锁会拒绝其他句柄读取被锁字节，
+    #: 锁在高位就能让持有人诊断信息（文件头部）始终可读，互斥语义不变。
+    LOCK_OFFSET = 1 << 20
+
+    def __init__(self, path):
         self.path = Path(path)
-        self.max_age_seconds = max_age_seconds
         self._fd = None
 
-    # ── 内部 ─────────────────────────────────────────────
-    def _try_create(self) -> bool:
+    # ── 平台原语 ─────────────────────────────────────────
+    @staticmethod
+    def _try_lock(fd: int) -> bool:
+        """非阻塞加锁 LOCK_OFFSET 处的 1 字节区域。成功 True；被占 False。"""
+        if msvcrt is not None:
+            try:
+                os.lseek(fd, InstanceLock.LOCK_OFFSET, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                return True
+            except OSError:
+                return False
+        if fcntl is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except OSError:
+                return False
+        raise RuntimeError("no OS file-lock primitive available on this platform")
+
+    @staticmethod
+    def _unlock(fd: int):
         try:
-            fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            return False
+            if msvcrt is not None:
+                os.lseek(fd, InstanceLock.LOCK_OFFSET, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            elif fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass  # close(fd) 时内核兜底释放
+
+    # ── 诊断信息 ─────────────────────────────────────────
+    def _write_holder(self):
         info = {"pid": os.getpid(), "host": socket.gethostname(),
-                "started": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "ts": time.time()}
-        os.write(fd, json.dumps(info).encode("utf-8"))
-        os.close(fd)
-        self._fd = True
-        return True
+                "started": time.strftime("%Y-%m-%d %H:%M:%S")}
+        try:
+            payload = (json.dumps(info) + "\n").encode("utf-8")
+            os.lseek(self._fd, 0, os.SEEK_SET)
+            os.write(self._fd, payload)
+            os.ftruncate(self._fd, len(payload))
+        except OSError:
+            pass  # 诊断信息写失败不影响互斥
 
     def _read_holder(self) -> dict:
-        try:
-            return json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception:
-            return {"pid": 0, "host": "unknown", "started": "unknown", "ts": 0}
-
-    def _stale(self, holder: dict) -> bool:
-        pid = int(holder.get("pid") or 0)
-        if pid:
-            # 有 pid 记录时只认进程存活 —— 活进程绝不因锁龄被接管，
-            # 否则长任务（>max_age）会被第二个实例破坏互斥（评审#2）。
-            return not pid_alive(pid)
-        # 无有效 pid（老格式/损坏锁文件）才退化为按锁龄判断
-        ts = float(holder.get("ts") or 0)
-        return bool(ts and time.time() - ts > self.max_age_seconds)
+        """读持有人信息；短暂重试规避写入中的半截 JSON；失败给占位值。"""
+        for _ in range(5):
+            try:
+                return json.loads(self.path.read_text(encoding="utf-8"))
+            except Exception:
+                time.sleep(0.02)
+        return {"pid": 0, "host": "unknown", "started": "unknown"}
 
     # ── 对外 ─────────────────────────────────────────────
     def acquire(self) -> "InstanceLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        if self._try_create():
-            return self
-        holder = self._read_holder()
-        if not self._stale(holder):
-            raise LockHeldError(holder)
-        # 残留锁接管：改名隔离后重新原子创建（并发接管只有一个能成功）
-        stale_path = self.path.with_suffix(".stale")
-        try:
-            os.replace(self.path, stale_path)
-        except FileNotFoundError:
-            pass
-        if self._try_create():
-            return self
-        # 接管竞争失败 = 别的活进程刚拿到，按正常占用处理
-        raise LockHeldError(self._read_holder())
+        fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT)
+        if not self._try_lock(fd):
+            os.close(fd)
+            raise LockHeldError(self._read_holder())
+        self._fd = fd
+        self._write_holder()
+        return self
 
     def release(self):
-        if self._fd:
-            try:
-                self.path.unlink(missing_ok=True)
-            finally:
-                self._fd = None
+        if self._fd is None:
+            return
+        try:
+            self._unlock(self._fd)
+        finally:
+            os.close(self._fd)
+            self._fd = None
 
     def __enter__(self):
         return self.acquire()
