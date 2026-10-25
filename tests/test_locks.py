@@ -34,6 +34,18 @@ if res["win"]:
     time.sleep(20)   # 持锁不放，由父进程决定后续
 """
 
+# 限时持有：拿到锁持 hold 秒后正常释放退出（模拟长任务）
+_WORKER_HOLD_TIMED = r"""
+import json, os, sys, time
+sys.path.insert(0, sys.argv[1])
+from src.locks import InstanceLock
+lk = InstanceLock(sys.argv[2]).acquire()
+with open(os.path.join(sys.argv[3], "result_%d.json" % os.getpid()), "w") as f:
+    json.dump({"win": True, "pid": os.getpid()}, f)
+time.sleep(float(sys.argv[4]))
+lk.release()
+"""
+
 # 竞争模式：反复尝试，拿到后持锁 0.4s 释放，记录持锁窗口
 _WORKER_CONTENTION = r"""
 import json, os, sys, time
@@ -58,9 +70,10 @@ with open(os.path.join(sys.argv[3], "result_%d.json" % os.getpid()), "w") as f:
 """
 
 
-def _spawn(worker, lock_path, result_dir):
+def _spawn(worker, lock_path, result_dir, *extra):
     return subprocess.Popen(
-        [sys.executable, "-c", worker, str(ROOT), str(lock_path), str(result_dir)],
+        [sys.executable, "-c", worker, str(ROOT), str(lock_path), str(result_dir),
+         *extra],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=str(ROOT))
 
 
@@ -163,3 +176,112 @@ def test_alive_holder_rejected_and_crash_recoverable(tmp_path):
         p.wait()
     # 持有者被硬杀：内核自动释放，无需任何"过期接管"流程
     InstanceLock(lock).acquire().release()
+
+
+# ── 第五轮评审新增用例 ──────────────────────────────────
+def test_holder_info_contains_unique_token(tmp_path):
+    """持有人信息含实例唯一 token（评审要求 2），且不同实例 token 不同。"""
+    lock = tmp_path / "l.lock"
+    a = InstanceLock(lock)
+    a.acquire()
+    info_a = json.loads(lock.read_text(encoding="utf-8"))
+    assert info_a["token"] and info_a["pid"] == os.getpid()
+    with pytest.raises(LockHeldError) as ei:
+        InstanceLock(lock).acquire()
+    # 被拒者读到的持有人 token 与持有者一致（诊断可追溯）
+    assert ei.value.holder.get("token") == info_a["token"]
+    a.release()
+
+
+def test_concurrent_takeover_of_dead_residue(tmp_path):
+    """多个进程同时接管同一把死进程残留锁：恰好一个获得生产权（评审要求 4）。"""
+    rdir1, rdir2 = tmp_path / "r1", tmp_path / "r2"
+    rdir1.mkdir()
+    rdir2.mkdir()
+    lock = tmp_path / "l.lock"
+    # 制造死进程残留：持有者被硬杀，不释放、锁文件仍在
+    victim = _spawn(_WORKER_ONE_SHOT, lock, rdir1)
+    try:
+        assert _wait_results(rdir1, 1, timeout=30)[0]["win"]
+    finally:
+        victim.kill()
+        victim.wait()
+    # 6 个进程同时争抢这把残留锁
+    procs = [_spawn(_WORKER_ONE_SHOT, lock, rdir2) for _ in range(6)]
+    try:
+        lines = _wait_results(rdir2, 6)
+    finally:
+        for p in procs:
+            p.kill()
+            p.wait()
+    assert len(lines) == 6
+    assert len([x for x in lines if x["win"]]) == 1, f"双持锁！{lines}"
+
+
+def test_race_on_corrupt_lock_file(tmp_path):
+    """锁文件为空/JSON 损坏时并发恢复：互斥不破坏，恰好一个胜出（评审要求 3/4）。"""
+    rdir = tmp_path / "results"
+    rdir.mkdir()
+    lock = tmp_path / "l.lock"
+    lock.write_bytes(b"\x00\xffnot json{{{ truncated")   # 模拟写一半崩溃
+    procs = [_spawn(_WORKER_ONE_SHOT, lock, rdir) for _ in range(6)]
+    try:
+        lines = _wait_results(rdir, 6)
+    finally:
+        for p in procs:
+            p.kill()
+            p.wait()
+    assert len(lines) == 6
+    assert len([x for x in lines if x["win"]]) == 1, f"双持锁！{lines}"
+    # 胜者已把损坏内容覆写为合法持有人信息
+    info = json.loads(lock.read_text(encoding="utf-8"))
+    assert info["token"]
+
+
+@pytest.mark.parametrize("junk", [b"", b"{corrupt", b"\x00\x01\x02"])
+def test_incomplete_lock_file_recoverable(tmp_path, junk):
+    """空文件/半截 JSON/二进制垃圾残留：单实例可直接恢复（评审要求 3）。"""
+    lock = tmp_path / "l.lock"
+    lock.write_bytes(junk)
+    lk = InstanceLock(lock)
+    lk.acquire()
+    info = json.loads(lock.read_text(encoding="utf-8"))
+    assert info["token"]                        # 残留已被覆写
+    lk.release()
+
+
+def test_stale_holder_release_cannot_remove_new_holders_lock(tmp_path):
+    """旧持有者的（重复）释放不会删除/破坏新持有者的锁（评审要求 4）。"""
+    lock = tmp_path / "l.lock"
+    a = InstanceLock(lock)
+    a.acquire()
+    with pytest.raises(LockHeldError):
+        InstanceLock(lock).acquire()
+    a.release()                                  # A 正常释放
+    b = InstanceLock(lock)
+    b.acquire()                                  # B 成为新持有者
+    a.release()                                  # A 的过期对象再次释放 → 必须是幂等空操作
+    # B 的锁依然有效：C 被拒绝
+    with pytest.raises(LockHeldError):
+        InstanceLock(lock).acquire()
+    assert lock.is_file()                        # B 的锁文件未被删除
+    b.release()
+    InstanceLock(lock).acquire().release()       # B 释放后一切如常
+
+
+def test_long_task_holder_never_taken_over(tmp_path):
+    """长任务保护（评审要求 5）：活进程持锁期间反复尝试均被拒绝，
+    与持锁时长无关；正常释放后立刻可获取。"""
+    rdir = tmp_path / "results"
+    rdir.mkdir()
+    lock = tmp_path / "l.lock"
+    p = _spawn(_WORKER_HOLD_TIMED, lock, rdir, "3.0")
+    try:
+        assert _wait_results(rdir, 1, timeout=30)[0]["win"]   # 子进程已持锁
+        for attempt in range(3):                 # 3 秒长任务窗口内持续被拒
+            with pytest.raises(LockHeldError):
+                InstanceLock(lock).acquire()
+            time.sleep(0.8)
+    finally:
+        p.wait(timeout=60)                       # 子进程正常释放退出
+    InstanceLock(lock).acquire().release()       # 释放后立即可获取
