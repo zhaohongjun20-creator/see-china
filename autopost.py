@@ -257,9 +257,10 @@ def _produce(topic: str, cfg: dict, store: Store, zhipu: str, pex: str) -> int:
     for w in doc.get("_warnings", []):
         log.warning("script warning: %s", w)
 
-    # ── 阶段 2：逐段配音（段级缓存：文本/音色/后端未变则复用） ──
+    # ── 阶段 2：逐段配音（段级缓存 + CosyVoice 批量接管 + 多级降级链） ──
     narr_cfg = cfg["narrator"]
     backend = narr_cfg.get("backend", "edge")
+    nsec = len(doc["sections"])
 
     def narration_done():
         return mf.stage_status("narration") == "done"
@@ -268,25 +269,61 @@ def _produce(topic: str, cfg: dict, store: Store, zhipu: str, pex: str) -> int:
         job.narration_dir.mkdir(parents=True, exist_ok=True)
         z = {"api_key": zhipu, **(narr_cfg.get("zhipu") or {})} \
             if backend == "zhipu" else None
+        cosy = narr_cfg.get("cosy") or {}
+
+        def narr_fp(i: int) -> str:
+            return cachekeys.narration_fingerprint(
+                doc["sections"][i]["text"], narr_cfg["voice"],
+                narr_cfg.get("rate", "+0%"), backend, script_hash)
+
         reused = total_s = 0
-        for i, sec in enumerate(doc["sections"]):
-            fp = cachekeys.narration_fingerprint(
-                sec["text"], narr_cfg["voice"], narr_cfg.get("rate", "+0%"),
-                backend, script_hash)
+        missing = []
+        for i in range(nsec):
+            fp = narr_fp(i)
             rec = mf.section(i).get("narration")
             if (rec and rec.get("hash") == fp and rec.get("duration", 0) > 0
                     and Path(rec["file"]).is_file()):
                 reused += 1
                 total_s += rec["duration"]
                 jobman.log_event(job, "cache_hit", stage="narration", section=i)
-                continue
+            else:
+                missing.append(i)
+
+        # CosyVoice2 本地大模型批量接管（质量第一梯队；只补缺段，断点续跑友好）
+        if missing and cosy.get("enable"):
+            try:
+                paths = narrator.synth_cosy_batch(
+                    [doc["sections"][i] for i in missing],
+                    str(job.narration_dir), cosy, indices=missing)
+                for i, p in zip(missing, paths):
+                    dur = narrator.audio_duration(p)
+                    if dur <= 0:
+                        raise RuntimeError(f"narration {i}: zero-length audio")
+                    mf.set_section(i, "narration",
+                                   {"hash": narr_fp(i), "file": str(p),
+                                    "duration": dur, "backend": backend,
+                                    "backend_used": "cosy",
+                                    "voice": f"cosy:{cosy.get('mode', 'zero_shot')}"})
+                    total_s += dur
+                    jobman.log_event(job, "narration_section", section=i,
+                                     duration=dur, file=Path(p).name,
+                                     backend_used="cosy")
+                missing = []
+                log.info("CosyVoice2 batch done: %d sections", len(paths))
+            except Exception as e:
+                jobman.log_event(job, "cosy_failed", error=str(e)[:300])
+                log.warning("CosyVoice2 失败，降级逐段链路: %s", e)
+
+        # 逐段链路：zhipu → edge → 音色熔断池 → Piper 本地神经 → SAPI(仅手动)
+        for i in missing:
+            fp = narr_fp(i)
             for old in (job.narration_path(i),
                         job.narration_path(i).with_suffix(".wav")):
                 Path(old).unlink(missing_ok=True)
             actual, used_backend, used_voice = narrator.synth_section(
-                sec["text"], str(job.narration_path(i)), narr_cfg["voice"],
-                narr_cfg.get("rate", "+0%"), backend=backend, zhipu=z,
-                allow_sapi=bool(narr_cfg.get("allow_sapi_fallback", False)))
+                doc["sections"][i]["text"], str(job.narration_path(i)),
+                narr_cfg["voice"], narr_cfg.get("rate", "+0%"), backend=backend,
+                zhipu=z, allow_sapi=bool(narr_cfg.get("allow_sapi_fallback", False)))
             dur = narrator.audio_duration(actual)
             if dur <= 0:
                 raise RuntimeError(f"narration {i}: zero-length audio")
@@ -607,6 +644,57 @@ def cmd_review_job(job_id: str, approve: bool) -> int:
     return 0
 
 
+def tts_report(cfg: dict) -> list:
+    """TTS 后端真实可用性报告（免费/本地探针，不消耗付费额度）。"""
+    rows = []
+    s = narrator.probe_edge()
+    rows.append(("edge-tts", s, {
+        "ok": "微软神经音色可用",
+        "blocked403": "微软端封堵（403），等恢复即可；期间自动降级",
+        "network": "本机网络不可达微软语音端点",
+    }.get(s, "异常，见日志")))
+    s = narrator.probe_piper()
+    rows.append(("piper", s, {
+        "ok": f"本地神经音色 {Path(narrator.PIPER_MODEL).name}（离线可用）",
+        "missing:package": "未安装 piper-tts（pip install piper-tts）",
+        "missing:model": f"缺少模型 {narrator.PIPER_MODEL}",
+    }.get(s, "异常")))
+    cosy = (cfg.get("narrator") or {}).get("cosy") or {}
+    if cosy.get("enable"):
+        if narrator.cosy_env_ready():
+            rows.append(("cosyvoice2", "ready",
+                         "本地大模型批量合成（质量最优；优先接管，首次加载较慢）"))
+        else:
+            rows.append(("cosyvoice2", "missing:env",
+                         f"环境缺失（{narrator._COSY_PY}），将自动降级逐段链路"))
+    zhipu_key = bool(os.environ.get("ZHIPU_API_KEY"))
+    rows.append(("zhipu cogtts", "key-set" if zhipu_key else "key-missing",
+                 "付费大模型 TTS，与讲稿共用 ZHIPU_API_KEY"
+                 if zhipu_key else "未配置 Key（可选后端）"))
+    return rows
+
+
+def cmd_doctor(check_services: bool = True) -> int:
+    """一键体检：precheck + TTS 链路真实探针。填完 .env 后先跑这个再生产。"""
+    cfg = load_config()
+    pc = precheck.run_precheck(cfg, BASE,
+                               os.environ.get("PEXELS_API_KEY", ""),
+                               os.environ.get("ZHIPU_API_KEY", ""),
+                               check_services=check_services)
+    print("== 启动检查 ==")
+    print(pc.summary())
+    print("== TTS 后端探测（不消耗任何付费额度）==")
+    for name, status, note in tts_report(cfg):
+        print(f"  {name:<12}: {status:<14} {note}")
+    print("== 结论 ==")
+    if not pc.ok:
+        print("  生成无法开始：先解决上面的 ERROR（补 .env / config / BGM 曲库）")
+        return 1
+    print("  可以开始生产：python autopost.py")
+    print("  配音承担顺序：cosyvoice2(若就绪) → 配置后端 → piper 本地兜底")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="See China episode producer")
     ap.add_argument("topic", nargs="?", type=int,
@@ -628,6 +716,9 @@ def main():
     g.add_argument("--reject", action="store_true")
     mp = sub.add_parser("mark-published", help="manual upload done")
     mp.add_argument("topic", type=int)
+    doc_p = sub.add_parser("doctor", help="全链路体检（不消耗额度）")
+    doc_p.add_argument("--no-services", action="store_true",
+                       help="跳过外网连通性检查")
     args = ap.parse_args()
 
     setup_logging()
@@ -643,6 +734,8 @@ def main():
         return 0
     if args.cmd == "review-job":
         return cmd_review_job(args.job_id, args.approve)
+    if args.cmd == "doctor":
+        return cmd_doctor(check_services=not getattr(args, "no_services", False))
     if args.cmd == "mark-published":
         store = Store(str(DATA_DIR / "topics.db"))
         cfg = load_config()

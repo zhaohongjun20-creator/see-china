@@ -4,6 +4,7 @@ python-dotenv==1.2.2
 PyYAML==6.0.3
 edge-tts==7.2.8
 imageio-ffmpeg==0.6.0
+piper-tts==1.8.0        # 本地神经配音兜底（离线；模型 ../tts_models/en_US-ryan-medium.onnx）
 
 # 开发/测试
 pytest==9.1.1

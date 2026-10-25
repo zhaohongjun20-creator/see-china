@@ -63,6 +63,13 @@ narrator:
   rate: "+3%"
   allow_sapi_fallback: false  # 默认关闭：SAPI 机械音不符合海外频道质量目标；
                               # 开启后若真的用了机械音，成片会被强制送人工审核
+  # CosyVoice2 本地大模型批量合成（质量第一梯队；enable 时优先接管，
+  # 失败自动降级 edge→Piper 本地神经音色；环境在 ../cosyvoice，与军史号共享）
+  cosy:
+    enable: true
+    mode: "instruct2"
+    prompt_wav: "repo/asset/cross_lingual_prompt.wav"
+    instruct: "Speak as a warm, engaging English documentary narrator"
   # backend: "zhipu" 时生效（可选）：
   # zhipu:
   #   model: "cogtts"

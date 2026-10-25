@@ -196,6 +196,21 @@ def check_paths(cfg: dict, project_dir: Path) -> list:
         except OSError as e:
             out.append(CheckResult(f"dir:{d}", False, "error",
                                    f"not writable: {e}"))
+
+    # 本地 TTS 资产（缺失只降级到下一后端，不拦截启动）
+    try:
+        from . import narrator as _narr
+        if not Path(_narr.PIPER_MODEL).is_file():
+            out.append(CheckResult("tts:piper_model", False, "warning",
+                                   f"piper model missing: {_narr.PIPER_MODEL}"))
+        narr = cfg.get("narrator") or {}
+        if (narr.get("cosy") or {}).get("enable") and not _narr.cosy_env_ready():
+            out.append(CheckResult("tts:cosy_env", False, "warning",
+                                   "cosy enabled but env missing — "
+                                   "will fall back to edge/piper chain"))
+    except Exception as e:  # narrator 导入失败不应阻断启动检查
+        out.append(CheckResult("tts", False, "warning",
+                               f"narrator import failed: {type(e).__name__}"))
     return out
 
 
