@@ -251,9 +251,10 @@ def generate(api_key: str, topic: str, model: str = "glm-4-flash",
     else:  # pragma: no cover
         raise ScriptError("script validation loop exited unexpectedly")
 
-    # 逐段扩写（outline 里的 text 为空时才扩写，保两步生成语义）
+    # 逐段扩写（outline 里 text 为空或过短都重新扩写——模型常在大纲里写
+    # 十来个词的提纲式 text，非空但低于 15 词会卡死最终校验）
     for i, sec in enumerate(doc["sections"], 1):
-        if not sec["text"]:
+        if len(sec["text"].split()) < 15:
             sec["text"] = _call(api_key, model,
                                 EXPAND_PROMPT.format(topic=topic, i=i,
                                                      n=len(doc["sections"]),
@@ -265,7 +266,11 @@ def generate(api_key: str, topic: str, model: str = "glm-4-flash",
     problems = validate(doc, n_min, n_max, c_lo, c_hi, require_text=True)
     hard = [p for p in problems if p["level"] == "hard"]
     if hard:
-        raise ScriptError("script failed final validation after expansion", problems)
+        detail = "; ".join(f"section {p['section']}: {p['problem']}"
+                           for p in hard)
+        raise ScriptError(
+            f"script failed final validation after expansion: {detail}",
+            problems)
     doc["_warnings"] = [p["problem"] for p in problems if p["level"] == "warn"]
 
     doc["_usage"] = usage.as_dict()
