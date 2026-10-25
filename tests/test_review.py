@@ -65,27 +65,122 @@ def test_ai_unavailable_on_any_failure(monkeypatch):
     assert res["status"] == "unavailable"       # 不允许降级为 pass
 
 
-def test_ai_malformed_issues_filtered(monkeypatch):
+def test_ai_malformed_issues_fail_closed(monkeypatch):
+    """含非法元素的问题列表 → 整包拒绝（fail-closed），不再是"过滤坏数据"。（评审 P1）"""
     monkeypatch.setattr(R, "_llm_json", lambda *a, **k: {
-        "verdict": "flagged", "issues": ["garbage", 42,
-                                         {"severity": "low", "issue": "ok"}]})
+        "verdict": "flagged",
+        "issues": ["invalid item", 42,
+                   {"section": 0, "severity": "low", "issue": "ok"}]})
     res = R.ai_review("k", _doc())
-    assert len(res["issues"]) == 1              # 非法条目被剔除
+    assert res["status"] == "unavailable"       # 有非法元素 → 整包不可用
+    assert res["raw_verdict"] is None
+
+
+def _resp(verdict="pass", issues=None):
+    return {"verdict": verdict,
+            "issues": issues if issues is not None else []}
+
+
+def test_ai_rejects_unknown_or_missing_verdict(monkeypatch):
+    """verdict 缺失/未知/类型错误 → 一律 unavailable（fail-closed）。（评审 P1）"""
+    for bad in ["approved", "ok", "", None, 1, True, ["pass"], {"v": 1}]:
+        monkeypatch.setattr(R, "_llm_json",
+                            lambda *a, _v=bad, **k: _resp(_v))
+        res = R.ai_review("k", _doc())
+        assert res["status"] == "unavailable", bad
+        assert res["raw_verdict"] is None
+
+
+def test_ai_accepts_case_insensitive_verdict(monkeypatch):
+    monkeypatch.setattr(R, "_llm_json", lambda *a, **k: _resp("  PASS  "))
+    assert R.ai_review("k", _doc())["status"] == "pass"
+
+
+def test_ai_rejects_non_object_response(monkeypatch):
+    monkeypatch.setattr(R, "_llm_json", lambda *a, **k: ["not", "a", "dict"])
+    assert R.ai_review("k", _doc())["status"] == "unavailable"
+
+
+def test_ai_rejects_non_list_issues(monkeypatch):
+    for bad_issues in ["no list", {"a": 1}, 42, None]:
+        # 直接构造原始响应，避免 _resp 把 None 归一化成 []
+        monkeypatch.setattr(R, "_llm_json",
+                            lambda *a, _i=bad_issues, **k:
+                            {"verdict": "pass", "issues": _i})
+        res = R.ai_review("k", _doc())
+        assert res["status"] == "unavailable", bad_issues
+
+
+@pytest.mark.parametrize("bad", [
+    "garbage",                                                   # 非字典
+    42,                                                          # 非字典
+    {"severity": "high", "issue": "x"},                          # 缺 section
+    {"section": 0, "issue": "x"},                                # 缺 severity
+    {"section": 0, "severity": "critical", "issue": "x"},        # 非法 severity
+    {"section": "0", "severity": "high", "issue": "x"},          # section 类型错
+    {"section": True, "severity": "high", "issue": "x"},         # bool 冒充 int
+    {"section": -2, "severity": "high", "issue": "x"},           # 非法段号
+    {"section": 0, "severity": "high"},                          # 缺 issue
+    {"section": 0, "severity": "high", "issue": "   "},          # 空描述
+    {"section": 0, "severity": "high", "issue": "x",
+     "needs_source": "yes"},                                     # needs_source 类型错
+    {"section": 0, "severity": "high", "issue": "x",
+     "suggestion": 5},                                           # suggestion 类型错
+])
+def test_ai_fail_closed_on_invalid_issue(monkeypatch, bad):
+    monkeypatch.setattr(R, "_llm_json",
+                        lambda *a, _i=bad, **k: _resp("pass", [_i]))
+    res = R.ai_review("k", _doc())
+    assert res["status"] == "unavailable", bad
+    assert "rejected" in res["issues"][0]["issue"]
+
+
+def test_ai_accepts_valid_issue_and_normalizes(monkeypatch):
+    good = {"section": 0, "severity": "HIGH", "issue": "wrong year",
+            "suggestion": "", "needs_source": True}
+    monkeypatch.setattr(R, "_llm_json", lambda *a, **k: _resp("flagged", [good]))
+    res = R.ai_review("k", _doc())
+    assert res["status"] == "flagged"
+    assert res["issues"][0]["severity"] == "high"
+    assert res["issues"][0]["needs_source"] is True
+
+
+def test_pass_with_issues_is_contradictory_fail_closed(monkeypatch):
+    good = {"section": 0, "severity": "low", "issue": "nit", "needs_source": False}
+    monkeypatch.setattr(R, "_llm_json", lambda *a, **k: _resp("pass", [good]))
+    assert R.ai_review("k", _doc())["status"] == "unavailable"
+
+
+def test_flagged_with_empty_issues_never_auto_ready(monkeypatch):
+    """评审 P1 核心场景：flagged + 空问题列表 → 人工裁决，绝不自动 ready。"""
+    monkeypatch.setattr(R, "_llm_json", lambda *a, **k: _resp("flagged", []))
+    res = R.ai_review("k", _doc())
+    assert res["status"] == "flagged"
+    assert R.decide(res) == "human"
 
 
 # ── 决策矩阵 ────────────────────────────────────────────
 def test_decide_matrix():
     assert R.decide({"status": "pass", "issues": []}) == "ready"
+    # 任何 flagged 都不允许自动放行（评审 P1）
+    assert R.decide({"status": "flagged", "issues": []}) == "human"
     assert R.decide({"status": "flagged",
-                     "issues": [{"severity": "high", "needs_source": False}]
+                     "issues": [{"severity": "low", "needs_source": False}]
                      }) == "human"
     assert R.decide({"status": "flagged",
                      "issues": [{"severity": "medium", "needs_source": True}]
-                     }) == "human"               # 缺来源 → 人工
+                     }) == "human"
     assert R.decide({"status": "flagged",
+                     "issues": [{"severity": "high", "needs_source": False}]
+                     }) == "human"
+    # 防御：pass 却带问题 → 交人工
+    assert R.decide({"status": "pass",
                      "issues": [{"severity": "low", "needs_source": False}]
-                     }) == "ready"
+                     }) == "human"
+    # fail-closed 默认：unavailable 与未知状态一律 retry
     assert R.decide({"status": "unavailable", "issues": []}) == "retry"
+    assert R.decide({"status": "weird-state"}) == "retry"
+    assert R.decide({}) == "retry"
 
 
 def test_decide_with_flags_matrix():

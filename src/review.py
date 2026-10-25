@@ -84,6 +84,41 @@ class ReviewUnavailable(Exception):
     """审核服务不可用 —— 上游必须按"未过审"处理，不得自动放行。"""
 
 
+# ── 严格 schema 校验（评审 P1：审核响应 fail-closed） ────
+_VALID_VERDICTS = {"pass", "flagged"}
+_VALID_SEVERITIES = {"high", "medium", "low"}
+
+
+def _unavailable(reason: str) -> dict:
+    """构造"审核通道不可用"结果。调用方必须按未过审处理（decide → retry）。"""
+    return {"status": "unavailable",
+            "issues": [{"section": -1, "severity": "high",
+                        "issue": f"review response rejected: {reason}",
+                        "suggestion": "retry later; do NOT publish unchecked",
+                        "needs_source": False}],
+            "raw_verdict": None}
+
+
+def _valid_issue(it) -> bool:
+    """单条问题元素的结构校验：任何字段缺失/类型错误/非法取值都视为整包非法。"""
+    if not isinstance(it, dict):
+        return False
+    sec = it.get("section")
+    if isinstance(sec, bool) or not isinstance(sec, int) or sec < -1:
+        return False
+    sev = it.get("severity")
+    if not isinstance(sev, str) or sev.strip().lower() not in _VALID_SEVERITIES:
+        return False
+    issue = it.get("issue")
+    if not isinstance(issue, str) or not issue.strip():
+        return False
+    if not isinstance(it.get("suggestion", ""), str):
+        return False
+    if not isinstance(it.get("needs_source", False), bool):
+        return False
+    return True
+
+
 # ── 第一层：确定性检查（不花 token） ─────────────────────
 _PLACEHOLDER = re.compile(r"TODO|FIXME|XXX|lorem ipsum|placeholder", re.I)
 
@@ -132,7 +167,13 @@ def ai_review(api_key: str, doc: dict, model: str = "glm-4-flash",
               temperature: float = 0.2) -> dict:
     """返回 {status: pass|flagged|unavailable, issues: [...], raw_verdict}。
 
-    status=unavailable 表示审核通道故障 —— 调用方必须当作未过审处理。
+    fail-closed（评审 P1）：响应必须是"结构完整 + verdict 合法 + 每个 issue
+    字段合法"才可能得到 pass/flagged；任何缺失/未知/类型错误一律转为
+    unavailable（decide → retry 等待重试），绝不放行。具体规则：
+    - verdict 只接受 pass/flagged（大小写与首尾空白容忍）；
+    - issues 必须是列表，元素逐条过 _valid_issue，有一条非法整包拒绝；
+    - pass 且 issues 非空（自相矛盾响应）→ unavailable；
+    - flagged 即使 issues 为空，decide() 也只进人工裁决，绝不自动 ready。
     """
     secs = "\n".join(
         f"[{i}] query={s.get('video_query', '')!r}\n{s.get('text', '')}"
@@ -144,25 +185,28 @@ def ai_review(api_key: str, doc: dict, model: str = "glm-4-flash",
         if any(s in str(e) for s in NON_CRITICAL_FAILURES):
             pass  # 明确允许降级的非关键故障（当前为空）
         else:
-            return {"status": "unavailable",
-                    "issues": [{"section": -1, "severity": "high",
-                                "issue": f"review channel unavailable: {e}",
-                                "suggestion": "retry later; do NOT publish unchecked",
-                                "needs_source": False}],
-                    "raw_verdict": None}
-    issues = data.get("issues") or []
+            return _unavailable(f"review channel unavailable: {e}")
+    if not isinstance(data, dict):
+        return _unavailable("response is not a JSON object")
+    verdict = data.get("verdict")
+    if not isinstance(verdict, str) or verdict.strip().lower() not in _VALID_VERDICTS:
+        return _unavailable(f"unknown/missing verdict: {verdict!r}")
+    issues_raw = data.get("issues")
+    if not isinstance(issues_raw, list):
+        return _unavailable(f"issues is not a list: {type(issues_raw).__name__}")
     clean = []
-    for it in issues:
-        if not isinstance(it, dict):
-            continue
-        clean.append({"section": int(it.get("section", -1)),
-                      "severity": str(it.get("severity", "medium")).lower(),
-                      "issue": str(it.get("issue", "")),
-                      "suggestion": str(it.get("suggestion", "")),
-                      "needs_source": bool(it.get("needs_source"))})
-    verdict = str(data.get("verdict", "")).lower()
-    status = "pass" if verdict == "pass" and not clean else "flagged"
-    return {"status": status, "issues": clean, "raw_verdict": verdict or None}
+    for it in issues_raw:
+        if not _valid_issue(it):
+            return _unavailable(f"invalid issue element: {str(it)[:120]!r}")
+        clean.append({"section": it["section"],
+                      "severity": it["severity"].strip().lower(),
+                      "issue": it["issue"].strip(),
+                      "suggestion": it.get("suggestion", ""),
+                      "needs_source": it.get("needs_source", False)})
+    status = "pass" if verdict.strip().lower() == "pass" else "flagged"
+    if status == "pass" and clean:
+        return _unavailable("contradictory response: verdict=pass with issues")
+    return {"status": status, "issues": clean, "raw_verdict": verdict}
 
 
 def run_review(api_key: str, doc: dict, model: str = "glm-4-flash") -> dict:
@@ -179,18 +223,19 @@ def run_review(api_key: str, doc: dict, model: str = "glm-4-flash") -> dict:
 
 
 def decide(result: dict) -> str:
-    """审核结果 → 管线决策：
-       ready  —— 通过，继续打包
-       human  —— 有 high 级或 needs_source 问题，等人工裁决
-       retry  —— 审核通道不可用，保留文件等待重试（绝不放行）
+    """审核结果 → 管线决策（fail-closed，评审 P1）：
+       ready  —— 仅当 status=pass 且问题列表为空（结构合法性由 ai_review 保证）
+       human  —— 任何 flagged（即使问题列表为空，也绝不允许自动放行）
+       retry  —— unavailable 或未知状态（fail-closed 默认：等待重试，保留文件）
     """
-    if result["status"] == "unavailable":
-        return "retry"
-    blocking = [i for i in result["issues"]
-                if i.get("severity") == "high" or i.get("needs_source")]
-    if result["status"] == "flagged" and blocking:
+    st = result.get("status")
+    if st == "pass":
+        if result.get("issues"):
+            return "human"                     # 防御：pass 却带问题 → 交人工
+        return "ready"
+    if st == "flagged":
         return "human"
-    return "ready"
+    return "retry"
 
 
 def decide_with_flags(result: dict, sapi_used: bool = False,
