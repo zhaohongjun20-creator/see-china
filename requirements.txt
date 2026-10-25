@@ -1,0 +1,9 @@
+# see-china 依赖（在 Python 3.12+ / Windows 与 Linux 均验证过的版本组合）
+requests==2.34.2
+python-dotenv==1.2.2
+PyYAML==6.0.3
+edge-tts==7.2.8
+imageio-ffmpeg==0.6.0
+
+# 开发/测试
+pytest==9.1.1

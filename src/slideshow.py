@@ -1,63 +1,50 @@
-"""幻灯片成片：史料图四向 Ken Burns + 旁白逐段对齐 + 交叉溶解转场 + BGM + 字幕。
+# -*- coding: utf-8 -*-
+"""成片合成（P1-6 配套重写：修复无音轨片段 concat 必败 + 音画对齐漂移）。
 
-转场音画对齐原理：每段视频（除末段）尾部多留 fade 秒画面，旁白说完后画面
-停留溶解切换（纪录片节奏）；音频 concat 后总长恰与 xfade 后视频总长相等。
+旧实现的两个问题：
+1. section_clip.build 输出 -an（无音轨）片段，compose_final 阶段 B 却按
+   [i:a] 对片段做音频 concat → 运行期必报错。
+2. 字幕/旁白按 sum(duration+tail) 推进，而 xfade 视频轨每个接缝缩短 fade 秒，
+   每段漂移 fade 秒，段数越多旁白越超前于画面。
+
+新时间线（统一基准 T_i = 段 i 画面完整可见的时刻）：
+    转场溶解占 [T_i - fade, T_i)；旁白 i 用 adelay 精确从 T_i 开始；
+    旁白 i 结束后画面停留 tail 秒才开始溶解 → 旁白永远踩在自己的画面上。
+    片段仍为纯视频轨；音频轨由旁白文件 + 延迟合成，BGM 在收尾混音时压限。
+
+三步结构保留（一步大 filter 图会因 apad 无限流+多级 xfade 死锁）：
+    A. 仅视频：多级 xfade（样式轮换）
+    B. 仅音频：旁白 aformat + adelay(T_i) + amix → 纯人声轨
+    C. 收尾：字幕烧录 + 人声/BGM 混音（sidechain ducking）
 """
+import re
 import subprocess
 from pathlib import Path
+
 import imageio_ffmpeg
 
 W, H, FPS = 1920, 1080, 30
-BIG = 2400  # 先放大再 zoom，减轻整数抖动
+
+# 纪录片字幕样式：白字黑边+轻阴影
+SUBTITLE_STYLE = ("FontName=Arial,FontSize=18,PrimaryColour=&H00FFFFFF,"
+                  "OutlineColour=&H96000000,BorderStyle=1,Outline=2,Shadow=1,MarginV=30,"
+                  "Alignment=2")
+
+# 段落转场轮换池（xfade 纪录片向：相邻切换不重样）
+DEFAULT_TRANSITIONS = ["fade", "dissolve", "wipeleft", "circleopen", "fadeblack"]
 
 
-def _kenburns(mode: str, frames: int) -> str:
-    """四向运镜：in 推近 / out 拉远 / panleft 左移 / panright 右移。"""
-    center = "iw/2-(iw/zoom/2)"
-    vcenter = "ih/2-(ih/zoom/2)"
-    if mode == "in":
-        return f"z='min(1.0+0.0006*on,1.12)':x='{center}':y='{vcenter}'"
-    if mode == "out":
-        return f"z='max(1.12-0.0006*on,1.0)':x='{center}':y='{vcenter}'"
-    if mode == "panright":
-        return (f"z='1.10':x='(iw-iw/zoom)*on/{frames}':y='{vcenter}'")
-    return f"z='1.10':x='(iw-iw/zoom)*(1-on/{frames})':y='{vcenter}'"
+def _ffmpeg():
+    return imageio_ffmpeg.get_ffmpeg_exe()
 
 
-def build_section_clip(img: str, voice_mp3: str, duration: float, out_mp4: str,
-                       mode: str = "in", stickers: list = None) -> str:
-    """史料图 Ken Burns + 旁白 +（可选）Twemoji 表情贴纸 overlay。"""
-    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    frames = max(2, int(duration * FPS))
-    vf = (f"scale={BIG}:{int(BIG*H/W)}:force_original_aspect_ratio=increase,"
-          f"crop={BIG}:{int(BIG*H/W)},"
-          f"zoompan={_kenburns(mode, frames)}"
-          f":d=1:s={W}x{H}:fps={FPS},setsar=1")
-
-    extra_inputs, chains, label = [], [], "[base]"
-    positions = [(W - 265, H - 400), (W - 450, H - 255)]   # 右侧偏下，避开字幕
-    for i, st in enumerate(stickers or []):
-        idx = 2 + i  # 输入：0=图 1=旁白 贴纸从2起
-        extra_inputs += ["-loop", "1", "-t", f"{duration:.3f}", "-i", st["path"]]
-        x, y = positions[i % len(positions)]
-        nxt = f"[s{i}]"
-        chains.append(f"{label}[{idx}:v]overlay=x={x}:y={y}:"
-                      f"enable='between(t,{st['at']:.2f},{st['at'] + 2.6:.2f})'{nxt}")
-        label = nxt
-
-    cmd = [ffmpeg, "-y", "-loop", "1", "-framerate", str(FPS),
-           "-t", f"{duration:.3f}", "-i", img,
-           "-i", voice_mp3, *extra_inputs]
-    if stickers:
-        fc = f"[0:v]{vf}[base];" + ";".join(chains)
-        cmd += ["-filter_complex", fc, "-map", label, "-map", "1:a"]
-    else:
-        fc = f"[0:v]{vf}[v]"
-        cmd += ["-filter_complex", fc, "-map", "[v]", "-map", "1:a"]
-    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k", "-shortest", out_mp4]
-    subprocess.run(cmd, check=True, capture_output=True, timeout=600)
-    return out_mp4
+def _probe_duration(path: str) -> float:
+    r = subprocess.run([_ffmpeg(), "-i", str(path)], capture_output=True,
+                       text=True, timeout=60)
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.?\d*)", r.stderr)
+    if not m:
+        raise RuntimeError(f"cannot read duration of {path}")
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
 
 
 def _fmt_ts(seconds: float) -> str:
@@ -68,99 +55,128 @@ def _fmt_ts(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def make_srt(narrations: list, path: str) -> str:
-    """每段旁白一条字幕，时间轴按段起点对齐（含转场偏移）。"""
-    lines, t0 = [], 0.0
-    for i, n in enumerate(narrations, 1):
-        lines += [str(i), f"{_fmt_ts(t0)} --> {_fmt_ts(t0 + n['duration'])}",
+def make_srt(narrations: list, path: str, starts: list = None) -> str:
+    """每段旁白一条字幕。starts 给定时按段画面起点对齐（新时间线）；
+    否则按旁白顺序累计（旧行为，向后兼容）。"""
+    lines = []
+    if starts is None:
+        t0, starts = 0.0, []
+        for n in narrations:
+            starts.append(t0)
+            t0 += n["duration"] + n.get("tail", 0.0)
+    for i, n in enumerate(narrations):
+        lines += [str(i + 1),
+                  f"{_fmt_ts(starts[i])} --> {_fmt_ts(starts[i] + n['duration'])}",
                   n["text"].replace("\n", " "), ""]
-        t0 += n["duration"] + n.get("tail", 0.0)
     Path(path).write_text("\n".join(lines), encoding="utf-8")
     return path
 
 
-# 纪录片字幕样式：白字黑边+轻阴影（抄 MoneyPrinterTurbo 的可配置思路，默认值内置）
-SUBTITLE_STYLE = ("FontName=Arial,FontSize=18,PrimaryColour=&H00FFFFFF,"
-                  "OutlineColour=&H96000000,BorderStyle=1,Outline=2,Shadow=1,MarginV=30,"
-                  "Alignment=2")
-
-# 段落转场轮换池（xfade 纪录片向：溶解/擦除/圆形展开/黑场）
-DEFAULT_TRANSITIONS = ["fade", "dissolve", "wipeleft", "circleopen", "fadeblack"]
-
-
-def compose_final(section_files: list, bgm_path: str, srt_path: str,
-                  out_path: str, bgm_volume: float = 0.22,
-                  fade: float = 0.6, transitions: list = None,
-                  subtitle_style: str = None) -> str:
-    """三步合成（一步大 filter 图会因 apad 无限流+多级 xfade 死锁）：
-    A. 仅视频：多级 xfade 转场（样式按 transitions 轮换，默认纪录片池）
-    B. 仅音频：concat 各段旁白
-    C. 收尾：视频字幕烧录 + 旁白/BGM 混音（sidechain 压低 BGM 突出人声）
-    """
-    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    n = len(section_files)
-    work = Path(out_path).with_suffix("")
-    v_only, a_only = f"{work}_v.mp4", f"{work}_a.m4a"
-
-    # 各段实际时长
-    durs = []
-    for f in section_files:
-        r = subprocess.run([ffmpeg, "-i", f], capture_output=True, text=True, timeout=60)
-        line = next((l for l in r.stderr.splitlines() if "Duration" in l), "")
-        hh, mm, ss = line.split("Duration:")[1].split(",")[0].strip().split(":")
-        durs.append(int(hh) * 3600 + int(mm) * 60 + float(ss))
-
-    # A. 仅视频 xfade（settb 统一时间基，xfade 的硬要求）
-    # acc=已合成流总长：offset=acc-fade，合成后 acc=offset+durs[i]（勿重复累加）
-    # 转场样式逐 junction 轮换（纪录片常见手法：相邻切换不重样）
+# ── A. 仅视频：多级 xfade ───────────────────────────────
+def _xfade_video(section_files: list, durs: list, fade: float,
+                 transitions: list, v_only: str):
+    """返回 (starts, video_len)。starts[i] = 段 i 完整可见时刻。"""
     styles = transitions or DEFAULT_TRANSITIONS
+    n = len(section_files)
     fc_parts, acc, cur = [f"[0:v]settb=AVTB[b0]"], durs[0], "[b0]"
+    starts = [0.0]
     for i in range(1, n):
         offset = max(0.0, acc - fade)
+        starts.append(offset + fade)
         style = styles[(i - 1) % len(styles)]
         fc_parts.append(f"[{i}:v]settb=AVTB,format=yuv420p[s{i}]")
         fc_parts.append(f"{cur}[s{i}]xfade=transition={style}:duration={fade}:"
                         f"offset={offset:.3f}[b{i}]")
         cur = f"[b{i}]"
         acc = offset + durs[i]
-    fc_a = ";".join(fc_parts)
-    cmd_a = [ffmpeg, "-y"]
+    cmd = [_ffmpeg(), "-y"]
     for f in section_files:
-        cmd_a += ["-i", str(Path(f).resolve())]
-    cmd_a += ["-filter_complex", fc_a, "-map", cur, "-an",
-              "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-              "-pix_fmt", "yuv420p", v_only]
-    subprocess.run(cmd_a, check=True, capture_output=True, timeout=3600)
+        cmd += ["-i", str(Path(f).resolve())]
+    cmd += ["-filter_complex", ";".join(fc_parts), "-map", cur, "-an",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-pix_fmt", "yuv420p", v_only]
+    subprocess.run(cmd, check=True, capture_output=True, timeout=3600)
+    return starts, acc
 
-    # B. 仅音频 concat
-    fc_b = ("".join(f"[{i}:a]" for i in range(n)) +
-            f"concat=n={n}:v=0:a=1[aout]")
-    cmd_b = [ffmpeg, "-y"]
-    for f in section_files:
-        cmd_b += ["-i", str(Path(f).resolve())]
-    cmd_b += ["-filter_complex", fc_b, "-map", "[aout]",
-              "-c:a", "aac", "-b:a", "192k", a_only]
-    subprocess.run(cmd_b, check=True, capture_output=True, timeout=600)
 
-    # C. 收尾：字幕 + BGM 混音（单视频流，轻）
-    # BGM ducking：旁白作 sidechain 触发源，说话时 BGM 自动压低（广播级配比），
-    # 比固定音量 amix 层次感好得多——bgm_volume 变为"无人声时的铺底基线"
+# ── B. 仅音频：旁白延迟对齐 ─────────────────────────────
+def _narration_track(voice_files: list, starts: list, a_only: str):
+    parts = []
+    for i, (vf, t) in enumerate(zip(voice_files, starts)):
+        ms = int(round(t * 1000))
+        parts.append(f"[{i}:a]aformat=sample_rates=44100:channel_layouts=stereo,"
+                     f"adelay={ms}:all=1[n{i}]")
+    mix = "".join(f"[n{i}]" for i in range(len(voice_files))) + \
+        f"amix=inputs={len(voice_files)}:duration=longest:normalize=0[aout]"
+    cmd = [_ffmpeg(), "-y"]
+    for f in voice_files:
+        cmd += ["-i", str(Path(f).resolve())]
+    cmd += ["-filter_complex", ";".join(parts) + f";{mix}", "-map", "[aout]",
+            "-c:a", "aac", "-b:a", "192k", a_only]
+    subprocess.run(cmd, check=True, capture_output=True, timeout=600)
+
+
+def _filter_path(p) -> str:
+    """subtitles 滤镜的文件名：Windows 盘符冒号必须转义，整体加引号。"""
+    s = Path(p).as_posix()
+    if len(s) > 1 and s[1] == ":":
+        s = s[0] + "\\:" + s[2:]        # "C:/x" → "C\:/x"（s[1] 是冒号）
+    return f"'{s}'"
+
+
+def compose_final(section_files: list, voice_files: list, narrations: list,
+                  out_path: str, bgm_path: str, srt_path: str,
+                  bgm_volume: float = 0.22, fade: float = 0.6,
+                  tail: float = None, transitions: list = None,
+                  subtitle_style: str = None) -> dict:
+    """合成成片 + 字幕。返回 {starts, durations, duration, srt}。
+
+    narrations: [{text, ...}]（text 供字幕）；旁白时长从 voice 文件实测。
+    tail: 旁白结束后溶解前的停留秒数（默认 = fade，纪录片节奏）。
+    """
+    n = len(section_files)
+    if not (n == len(voice_files) == len(narrations)) or n == 0:
+        raise ValueError(f"section/voice/narration count mismatch: "
+                         f"{n}/{len(voice_files)}/{len(narrations)}")
+    tail = fade if tail is None else tail
+    work = Path(out_path).with_suffix("")
+    v_only, a_only = f"{work}_v.mp4", f"{work}_a.m4a"
+
+    durs = [_probe_duration(f) for f in section_files]
+    voice_durs = [_probe_duration(f) for f in voice_files]
+
+    # A. 视频 xfade（同时得到每段画面起点 T_i）
+    starts, video_len = _xfade_video(section_files, durs, fade, transitions, v_only)
+
+    # B. 旁白轨：adelay 到各自 T_i
+    _narration_track(voice_files, starts, a_only)
+
+    # 字幕：旁白 i 压在 [T_i, T_i+D_i)
+    cues = [{"duration": d, "text": narrations[i]["text"]}
+            for i, d in enumerate(voice_durs)]
+    make_srt(cues, srt_path, starts=starts)
+
+    # C. 收尾：字幕 + ducking 混音
     style = subtitle_style or SUBTITLE_STYLE
     fc_c = (f"[1:a]asplit=2[voice][key];"
+            f"[voice]apad=whole_dur={video_len:.3f}[voicep];"
             f"[2:a]volume={bgm_volume}[bg];"
             f"[bg][key]sidechaincompress=threshold=0.02:ratio=6:attack=150:release=900[bgd];"
-            f"[voice][bgd]amix=inputs=2:duration=first:normalize=0[aout];"
-            f"[0:v]subtitles={Path(srt_path).as_posix()}"
+            f"[voicep][bgd]amix=inputs=2:duration=first:normalize=0[aout];"
+            f"[0:v]subtitles={_filter_path(srt_path)}"
             f":force_style='{style}'[vout]")
-    cmd_c = [ffmpeg, "-y", "-i", v_only, "-i", a_only,
-             "-stream_loop", "-1", "-i", bgm_path,
+    cmd_c = [_ffmpeg(), "-y", "-i", v_only, "-i", a_only,
+             "-stream_loop", "-1", "-i", str(bgm_path),
              "-filter_complex", fc_c,
              "-map", "[vout]", "-map", "[aout]",
-             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
-             "-c:a", "aac", "-b:a", "192k", "-shortest", out_path]
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+             "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+             "-t", f"{video_len:.3f}", out_path]
     try:
         subprocess.run(cmd_c, check=True, capture_output=True, timeout=3600)
     finally:
         Path(v_only).unlink(missing_ok=True)
         Path(a_only).unlink(missing_ok=True)
-    return out_path
+    return {"starts": starts, "durations": durs,
+            "voice_durations": voice_durs, "duration": video_len,
+            "srt": str(srt_path)}

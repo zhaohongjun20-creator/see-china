@@ -54,22 +54,27 @@ def _synth_zhipu(text: str, out_path: str, api_key: str, model: str, voice: str)
 
 def synth_section(text: str, out_path: str, voice: str, rate: str,
                   backend: str = "edge", zhipu: dict | None = None,
-                  allow_sapi: bool = False) -> str:
+                  allow_sapi: bool = False) -> tuple:
     """按后端合成；zhipu 失败降级 edge；edge 指定音色失败自动换熔断池音色。
+
+    返回 (音频路径, 实际使用的后端, 实际使用的音色) —— 供上层如实记录到
+    manifest（评审要求 #6：配音降级必须留痕，SAPI 机械音强制人工审核）。
 
     质量闸门：神经音色全灭时默认直接抛错（今日不发，等恢复），
     绝不放 SAPI 机械音上线——"产线可以断，烂片不能发"。
-    allow_sapi=True 时才允许本地 SAPI 兜底（仅供手动救急）。
+    allow_sapi=True 时才允许本地 SAPI 兜底（仅供手动救急，成片会标记待人工审核）。
     """
     if backend == "zhipu" and zhipu and zhipu.get("api_key"):
         try:
-            return _synth_zhipu(text, out_path, zhipu["api_key"],
-                                zhipu.get("model", "cogtts"),
-                                zhipu.get("voice", "tongtong"))
+            _synth_zhipu(text, out_path, zhipu["api_key"],
+                         zhipu.get("model", "cogtts"),
+                         zhipu.get("voice", "tongtong"))
+            return out_path, "zhipu", zhipu.get("voice", "tongtong")
         except Exception as e:
             print(f"[narrator] zhipu TTS 失败，降级 edge: {e}")
     try:
-        return _synth_edge(text, out_path, voice, rate)
+        _synth_edge(text, out_path, voice, rate)
+        return out_path, "edge", voice
     except Exception as e:
         for fb in EDGE_FALLBACK_VOICES:
             if fb == voice:
@@ -77,16 +82,16 @@ def synth_section(text: str, out_path: str, voice: str, rate: str,
             try:
                 _synth_edge(text, out_path, fb, rate)
                 print(f"[narrator] 音色 {voice} 失败({type(e).__name__})，已熔断降级 → {fb}")
-                return out_path
+                return out_path, "edge", fb
             except Exception:
                 continue
         if allow_sapi:
             try:
                 wav = _synth_sapi(text, out_path)
                 print(f"[narrator] 质量闸门放行(手动模式)：本地 SAPI 兜底 → {wav}")
-                return wav
+                return wav, "sapi", SAPI_VOICE
             except Exception as e2:
-                raise RuntimeError(f"edge 与 SAPI 均失败: {e2}")
+                raise RuntimeError(f"edge 与 SAPI 均失败: {e2}") from e2
         raise RuntimeError(
             "edge-tts 神经音色全部不可用（微软端封堵中）。质量闸门：今日不发布，"
             "等恢复后自动继续；拒绝 SAPI 机械音上线。")
@@ -106,13 +111,15 @@ def audio_duration(path: str) -> float:
 def narrate(sections: list, out_dir: str, voice: str, rate: str,
             backend: str = "edge", zhipu: dict | None = None,
             allow_sapi: bool = False) -> list:
-    """逐段配音；返回 [{path, duration, text}]。"""
+    """逐段配音；返回 [{path, duration, text, backend, voice}]。"""
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     results = []
     for i, sec in enumerate(sections):
         mp3 = f"{out_dir}/sec_{i:02d}.mp3"
-        actual = synth_section(sec["text"], mp3, voice, rate, backend=backend,
-                               zhipu=zhipu, allow_sapi=allow_sapi)
+        actual, used_backend, used_voice = synth_section(
+            sec["text"], mp3, voice, rate, backend=backend,
+            zhipu=zhipu, allow_sapi=allow_sapi)
         results.append({"path": actual, "duration": audio_duration(actual),
-                        "text": sec["text"]})
+                        "text": sec["text"], "backend": used_backend,
+                        "voice": used_voice})
     return results

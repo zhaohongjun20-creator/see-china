@@ -31,16 +31,25 @@ topics:
   - "Dragon Boat Festival: Racing the River"
   - "Mid-Autumn: The Festival of the Moon"
 
+# 同一选题失败重试上限（超过后不再自动领取，需 redo <序号> 手动重置）
+max_retries: 3
+
 video:
-  width: 1920
+  width: 1920          # 当前渲染管线按 1920x1080@30 硬编码，改这里会触发 precheck 警告
   height: 1080
   fps: 30
   sections_min: 10         # 段数（英文 55-95 词/段 → 每段 20-35 秒）
   sections_max: 14
   chars_per_section: [55, 95]   # 英文按词数计
 
+# 讲稿结构校验失败的"修复重试"次数（仍不合法则整体失败，不带病进素材阶段）
+script:
+  max_fix_attempts: 2
+
 transition:
-  fade_seconds: 0.6
+  fade_seconds: 0.6        # 溶解时长
+  tail_seconds: 0.6        # 旁白结束后、溶解开始前的画面停留
+  end_hold_seconds: 2.0    # 片尾定格
   styles:                  # 转场轮换（旅行内容轻快些）
     - fade
     - dissolve
@@ -52,13 +61,33 @@ narrator:
   backend: "edge"             # edge 恢复后自动用 Guy/Aria 神经音色
   voice: "en-US-GuyNeural"    # 美式男声（旅行host感）
   rate: "+3%"
-  allow_sapi_fallback: true   # edge 被封期间允许 Zira 兜底（试播集用，人工上传前自行把关）
+  allow_sapi_fallback: false  # 默认关闭：SAPI 机械音不符合海外频道质量目标；
+                              # 开启后若真的用了机械音，成片会被强制送人工审核
+  # backend: "zhipu" 时生效（可选）：
+  # zhipu:
+  #   model: "cogtts"
+  #   voice: "tongtong"
 
 copywriter:
   model: "glm-4-flash"
   temperature: 0.8
 
+# 内容审核（P1-4）：审核通道异常一律不放行；high 级问题进入人工裁决
+review:
+  model: "glm-4-flash"
+
 bgm_volume: 0.20
-bgm_dir: "../bili-history/bgm"   # 复用军史号 CC 曲库
+bgm_dir: "../bili-history/bgm"   # 共享曲库显式路径；不存在/为空时 precheck 直接报错
 
 hashtags: ["SeeChina", "ChinaTravel", "ChinaExplained"]
+
+# 成片技术质检阈值（P1-6）—— 以下默认值待真实样片校准后调整，
+# 只拦截"明显坏片"：音画错位、近无声、超长黑帧、字幕越界等
+qc:
+  duration_tolerance_s: 2.5
+  max_silence_s: 8.0
+  min_mean_volume_db: -45.0
+  clip_threshold_db: -0.5
+  max_black_start_s: 1.5
+  max_black_ratio: 0.35
+  min_cover_bytes: 2048
