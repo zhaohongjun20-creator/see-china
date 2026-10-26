@@ -697,9 +697,12 @@ def cmd_doctor(check_services: bool = True) -> int:
 
 
 def main():
+    # 裸主题序号 → run <n>：顶层不能有位置参数，否则会吞掉子命令名
+    # （"autopost.py review-job x" 曾被解析成 topic="review-job" 而崩溃）
+    argv = sys.argv[1:]
+    if argv and argv[0].isdigit():
+        argv = ["run"] + argv
     ap = argparse.ArgumentParser(description="See China episode producer")
-    ap.add_argument("topic", nargs="?", type=int,
-                    help="主题序号(从1)；等价于 run <topic>")
     sub = ap.add_subparsers(dest="cmd")
     run_p = sub.add_parser("run", help="produce one episode")
     run_p.add_argument("topic", nargs="?", type=int, help="主题序号(从1)")
@@ -720,7 +723,7 @@ def main():
     doc_p = sub.add_parser("doctor", help="全链路体检（不消耗额度）")
     doc_p.add_argument("--no-services", action="store_true",
                        help="跳过外网连通性检查")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     setup_logging()
     log = logging.getLogger("cli")
@@ -744,10 +747,10 @@ def main():
         store.mark_published(topic)
         log.info("published: %s", topic)
         return 0
-    # 默认 run
-    idx = getattr(args, "topic", None)
+    # 默认 run（run 子命令的主题序号在此转发；无子命令 = 自动选题）
     try:
-        return run(idx, redo=getattr(args, "redo", False),
+        return run(getattr(args, "topic", None),
+                   redo=getattr(args, "redo", False),
                    check_services=not getattr(args, "no_services", False))
     except RuntimeError as e:
         # precheck 失败 / 锁被占用等可预期错误：干净报错，不留 traceback
